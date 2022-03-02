@@ -1,6 +1,7 @@
 local constants = require "kong.constants"
 local sha256 = require "resty.sha256"
 local openssl_hmac = require "resty.openssl.hmac"
+local openssl_pkey = require "resty.openssl.pkey"
 local utils = require "kong.tools.utils"
 
 
@@ -31,18 +32,41 @@ local SIGNATURE_NOT_VALID = "HMAC signature cannot be verified"
 local SIGNATURE_NOT_SAME = "HMAC signature does not match"
 
 
-local hmac = {
-  ["hmac-sha1"] = function(secret, data)
-    return hmac_sha1(secret, data)
+local function verify_rsa(secret, signature, signing_string,  md_alg)
+  local pub, err = openssl_pkey.new(secret)
+  if not pub then
+    kong.log.err("failed to create public key : ", err)
+    return false
+  end
+
+  local verified, err = pub:verify(signature, signing_string, md_alg)
+  if not err then
+    return verified
+  else
+    kong.log.err("failed to verify signature : ", err)
+    return false
+  end
+end
+
+
+local verifications = {
+  ["hmac-sha1"] = function(secret, signature, signing_string)
+    return signature == hmac_sha1(secret, signing_string)
   end,
-  ["hmac-sha256"] = function(secret, data)
-    return openssl_hmac.new(secret, "sha256"):final(data)
+  ["hmac-sha256"] = function(secret, signature, signing_string)
+    return signature == openssl_hmac.new(secret, "sha256"):final(signing_string)
   end,
-  ["hmac-sha384"] = function(secret, data)
-    return openssl_hmac.new(secret, "sha384"):final(data)
+  ["hmac-sha384"] = function(secret, signature, signing_string)
+    return signature == openssl_hmac.new(secret, "sha384"):final(signing_string)
   end,
-  ["hmac-sha512"] = function(secret, data)
-    return openssl_hmac.new(secret, "sha512"):final(data)
+  ["hmac-sha512"] = function(secret, signature, signing_string)
+    return signature == openssl_hmac.new(secret, "sha512"):final(signing_string)
+  end,
+  ["rsa-sha256"] = function(secret, signature, signing_string)
+    return verify_rsa(secret, signature, signing_string, "sha256")
+  end,
+  ["rsa-sha512"] = function(secret, signature, signing_string)
+    return verify_rsa(secret, signature, signing_string, "sha512")
   end,
 }
 
@@ -97,7 +121,7 @@ local function retrieve_hmac_fields(authorization_header)
   -- parse the header to retrieve hamc parameters
   if authorization_header then
     local iterator, iter_err = re_gmatch(authorization_header,
-                                         "\\s*[Hh]mac\\s*username=\"(.+)\"," ..
+                                         "(\\s*[Hh]mac)?\\s*username=\"(.+)\"," ..
                                          "\\s*algorithm=\"(.+)\",\\s*header" ..
                                          "s=\"(.+)\",\\s*signature=\"(.+)\"",
                                          "jo")
@@ -113,10 +137,10 @@ local function retrieve_hmac_fields(authorization_header)
     end
 
     if m and #m >= 4 then
-      hmac_params.username = m[1]
-      hmac_params.algorithm = m[2]
-      hmac_params.hmac_headers = utils.split(m[3], " ")
-      hmac_params.signature = m[4]
+      hmac_params.username = m[2]
+      hmac_params.algorithm = m[3]
+      hmac_params.hmac_headers = utils.split(m[4], " ")
+      hmac_params.signature = m[5]
     end
   end
 
@@ -126,7 +150,7 @@ end
 
 -- plugin assumes the request parameters being used for creating
 -- signature by client are not changed by core or any other plugin
-local function create_hash(request_uri, hmac_params)
+local function generate_signing_string(request_uri, hmac_params)
   local signing_string = ""
   local hmac_headers = hmac_params.hmac_headers
 
@@ -161,20 +185,22 @@ local function create_hash(request_uri, hmac_params)
     end
   end
 
-  return hmac[hmac_params.algorithm](hmac_params.secret, signing_string)
+  return signing_string
 end
 
 
 local function validate_signature(hmac_params)
-  local signature_1 = create_hash(kong_request.get_path_with_query(), hmac_params)
-  local signature_2 = decode_base64(hmac_params.signature)
-  if signature_1 == signature_2 then
+  local signature = decode_base64(hmac_params.signature)
+  local signing_string = generate_signing_string(kong_request.get_path_with_query(), hmac_params)
+  local verified = verifications[hmac_params.algorithm](hmac_params.secret, signature, signing_string)
+
+  if verified then
     return true
   end
 
   -- DEPRECATED BY: https://github.com/Kong/kong/pull/3339
-  local signature_1_deprecated = create_hash(ngx.var.uri, hmac_params)
-  return signature_1_deprecated == signature_2
+  local signing_string_deprecated = generate_signing_string(ngx.var.uri, hmac_params)
+  return verifications[hmac_params.algorithm](hmac_params.secret, signature, signing_string_deprecated)
 end
 
 
